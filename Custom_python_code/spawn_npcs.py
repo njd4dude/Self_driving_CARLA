@@ -5,6 +5,8 @@ CarlaUE4.exe must already be running (use load_map.py first if you need a town).
 The ego vehicle is the actor an autonomous agent would control. NPC vehicles use
 Traffic Manager autopilot. Pedestrians walk to random navigation points.
 
+An RGB camera is attached to the ego vehicle and frames are saved under _out/.
+
 Press Ctrl+C to destroy spawned actors and exit.
 
 Examples:
@@ -12,9 +14,11 @@ Examples:
     python spawn_npcs.py --vehicles 50 --walkers 20
     python spawn_npcs.py --no-autopilot
     python spawn_npcs.py --follow
+    python spawn_npcs.py --output _out
 """
 
 import argparse
+import os
 import random
 import time
 
@@ -96,6 +100,16 @@ def spawn_walkers(world, count):
     return walkers, controllers
 
 
+def attach_rgb_camera(world, ego_vehicle, output_dir):
+    os.makedirs(output_dir, exist_ok=True)
+    camera_init_trans = carla.Transform(carla.Location(z=1.5))
+    camera_bp = world.get_blueprint_library().find('sensor.camera.rgb')
+    camera = world.spawn_actor(camera_bp, camera_init_trans, attach_to=ego_vehicle)
+    pattern = os.path.join(output_dir, '%06d.png').replace('\\', '/')
+    camera.listen(lambda image: image.save_to_disk(pattern % image.frame))
+    return camera
+
+
 def follow_ego(world, ego):
     spectator = world.get_spectator()
     transform = ego.get_transform()
@@ -108,10 +122,39 @@ def follow_ego(world, ego):
     )
 
 
-def destroy_actors(actors):
+def destroy_actors(client, actors):
+    actor_ids = []
     for actor in actors:
-        if actor is not None and actor.is_alive:
-            actor.destroy()
+        if actor is None:
+            continue
+        try:
+            actor_ids.append(actor.id)
+        except Exception:
+            pass
+    if actor_ids:
+        client.apply_batch([carla.command.DestroyActor(actor_id) for actor_id in actor_ids])
+
+
+def traffic_actors(world):
+    actors = world.get_actors()
+    return (
+        list(actors.filter('vehicle.*'))
+        + list(actors.filter('walker.*'))
+        + list(actors.filter('controller.ai.walker'))
+        + list(actors.filter('sensor.*'))
+    )
+
+
+def clear_traffic(client, world):
+    actors = traffic_actors(world)
+    for actor in actors:
+        if actor.type_id.startswith('sensor.') or actor.type_id.startswith('controller.'):
+            try:
+                actor.stop()
+            except Exception:
+                pass
+    destroy_actors(client, actors)
+    return len(actors)
 
 
 def main():
@@ -124,14 +167,22 @@ def main():
     parser.add_argument('--no-autopilot', action='store_true', help='Spawn vehicles parked, without Traffic Manager')
     parser.add_argument('--ego-autopilot', action='store_true', help='Also put the ego vehicle on autopilot')
     parser.add_argument('--follow', action='store_true', help='Keep the spectator camera behind the ego vehicle')
+    parser.add_argument('--output', default='_out', help='Folder for RGB camera PNGs (default: _out)')
+    parser.add_argument('--no-record', action='store_true', help='Do not attach the ego RGB camera')
     args = parser.parse_args()
 
     client, world = connect(args.host, args.port)
     map_name = world.get_map().name.replace('/Game/Carla/Maps/', '').split('/')[-1]
     print('Connected. Current map: %s' % map_name)
 
+    leftover = clear_traffic(client, world)
+    if leftover:
+        world.wait_for_tick()
+        print('Removed %d leftover vehicles, walkers, and sensors' % leftover)
+
     npc_vehicles = []
     ego_vehicle = None
+    camera = None
     walkers = []
     controllers = []
 
@@ -142,6 +193,14 @@ def main():
         ego_vehicle = spawn_ego_vehicle(world, spawn_points, len(npc_vehicles))
         print('Spawned ego vehicle: %s (id=%d)' % (ego_vehicle.type_id, ego_vehicle.id))
         follow_ego(world, ego_vehicle)
+
+        if not args.no_record:
+            output_dir = args.output
+            if not os.path.isabs(output_dir):
+                repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                output_dir = os.path.join(repo_root, output_dir)
+            camera = attach_rgb_camera(world, ego_vehicle, output_dir)
+            print('RGB camera recording to %s' % output_dir)
 
         walkers, controllers = spawn_walkers(world, args.walkers)
         print('Spawned %d / %d pedestrians' % (len(walkers), args.walkers))
@@ -167,11 +226,18 @@ def main():
         print('\nStopping...')
     finally:
         print('Destroying spawned actors...')
-        for controller in controllers:
-            if controller is not None and controller.is_alive:
-                controller.stop()
-        destroy_actors(controllers + walkers + npc_vehicles + [ego_vehicle])
-        time.sleep(0.25)
+        try:
+            if camera is not None:
+                camera.stop()
+            time.sleep(0.5)
+            for controller in controllers:
+                if controller is not None:
+                    controller.stop()
+            removed = clear_traffic(client, world)
+            time.sleep(0.25)
+            print('Removed %d actors' % removed)
+        except Exception as exc:
+            print('Cleanup failed: %s' % exc)
         print('Done.')
 
 
