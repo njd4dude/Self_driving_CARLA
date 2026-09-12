@@ -1,0 +1,11 @@
+# CARLA Windows release (download separately)
+CARLA_0.9.16/
+
+# Generated sensor / screenshot dumps
+_out/
+
+# Python
+Custom_python_code/.venv/
+__pycache__/
+
+
