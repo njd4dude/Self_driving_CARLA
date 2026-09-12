@@ -7,7 +7,15 @@ Traffic Manager autopilot. Pedestrians walk to random navigation points.
 
 An RGB camera is attached to the ego vehicle and frames are saved under _out/.
 
-Press Ctrl+C to destroy spawned actors and exit.
+Press Ctrl+C or ESC to destroy spawned actors and exit.
+
+Click the pygame window so keys go to the ego Mustang.
+
+  W / S         throttle / brake
+  A / D         steer
+  Space         handbrake
+  Q             reverse
+  ESC           quit
 
 Examples:
     python spawn_npcs.py
@@ -15,6 +23,7 @@ Examples:
     python spawn_npcs.py --no-autopilot
     python spawn_npcs.py --follow
     python spawn_npcs.py --output _out
+    python spawn_npcs.py --ego-autopilot
 """
 
 import argparse
@@ -24,8 +33,14 @@ import time
 
 import carla
 
+try:
+    import pygame
+    from pygame.locals import K_ESCAPE, K_SPACE, K_a, K_d, K_q, K_s, K_w
+except ImportError:
+    raise RuntimeError('pygame is required. Install it with: pip install pygame')
 
-def connect(host, port, timeout=30.0):
+
+def connect(host, port, timeout=10.0):
     client = carla.Client(host, port)
     client.set_timeout(timeout)
     return client, client.get_world()
@@ -52,17 +67,18 @@ def spawn_npc_vehicles(world, count):
 
 
 def spawn_ego_vehicle(world, spawn_points, used_count):
-    vehicle_blueprints = world.get_blueprint_library().filter('*vehicle*')
+    library = world.get_blueprint_library()
+    blueprint = library.find('vehicle.ford.mustang')
     leftover = spawn_points[used_count:] or spawn_points
     random.shuffle(leftover)
 
+    if blueprint.has_attribute('color'):
+        blueprint.set_attribute(
+            'color', random.choice(blueprint.get_attribute('color').recommended_values)
+        )
+    blueprint.set_attribute('role_name', 'hero')
+
     for transform in leftover:
-        blueprint = random.choice(vehicle_blueprints)
-        if blueprint.has_attribute('color'):
-            blueprint.set_attribute(
-                'color', random.choice(blueprint.get_attribute('color').recommended_values)
-            )
-        blueprint.set_attribute('role_name', 'hero')
         ego = world.try_spawn_actor(blueprint, transform)
         if ego is not None:
             return ego
@@ -120,6 +136,66 @@ def follow_ego(world, ego):
             carla.Rotation(pitch=-12.0, yaw=transform.rotation.yaw),
         )
     )
+
+
+DRIVE_HELP = [
+    'Ego Mustang',
+    '',
+    'W/S  throttle/brake',
+    'A/D  steer     Space  handbrake',
+    'Q    reverse   ESC    quit',
+]
+
+
+def drive_ego(world, ego, follow):
+    pygame.init()
+    pygame.display.set_caption('CARLA ego — click this window to drive')
+    screen = pygame.display.set_mode((420, 200))
+    font = pygame.font.Font(None, 28)
+    clock = pygame.time.Clock()
+    reverse = False
+
+    print('Click the pygame window, then use WASD to drive.')
+    running = True
+    while running:
+        clock.tick(60)
+        keys = pygame.key.get_pressed()
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+            elif event.type == pygame.KEYDOWN:
+                if event.key == K_ESCAPE:
+                    running = False
+                elif event.key == K_q:
+                    reverse = not reverse
+                    print('Reverse %s' % ('on' if reverse else 'off'))
+
+        control = carla.VehicleControl()
+        control.throttle = 1.0 if keys[K_w] else 0.0
+        control.brake = 1.0 if keys[K_s] else 0.0
+        steer = 0.0
+        if keys[K_a]:
+            steer -= 0.7
+        if keys[K_d]:
+            steer += 0.7
+        control.steer = steer
+        control.hand_brake = bool(keys[K_SPACE])
+        control.reverse = reverse
+        ego.apply_control(control)
+
+        world.wait_for_tick()
+        if follow:
+            follow_ego(world, ego)
+
+        screen.fill((20, 20, 24))
+        y = 16
+        for line in DRIVE_HELP:
+            color = (230, 230, 230) if line else (20, 20, 24)
+            screen.blit(font.render(line, True, color), (16, y))
+            y += 28
+        pygame.display.flip()
+
+    pygame.quit()
 
 
 def destroy_actors(client, actors):
@@ -216,17 +292,22 @@ def main():
         else:
             print('Autopilot disabled; vehicles are parked')
 
-        print('Simulation populated. Press Ctrl+C to destroy actors and exit.')
-        while True:
-            world.wait_for_tick()
-            if args.follow:
-                follow_ego(world, ego_vehicle)
+        if args.ego_autopilot:
+            print('Ego is on autopilot. Press Ctrl+C to exit.')
+            while True:
+                world.wait_for_tick()
+                if args.follow:
+                    follow_ego(world, ego_vehicle)
+        else:
+            drive_ego(world, ego_vehicle, follow=True)
 
     except KeyboardInterrupt:
         print('\nStopping...')
     finally:
         print('Destroying spawned actors...')
         try:
+            if pygame.get_init():
+                pygame.quit()
             if camera is not None:
                 camera.stop()
             time.sleep(0.5)
