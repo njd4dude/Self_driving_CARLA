@@ -5,11 +5,13 @@ CarlaUE4.exe must already be running (use load_map.py first if you need a town).
 The ego vehicle is the actor an autonomous agent would control. NPC vehicles use
 Traffic Manager autopilot. Pedestrians walk to random navigation points.
 
-An RGB camera is attached to the ego vehicle and frames are saved under _out/.
+A chase camera is shown in the pygame window (same idea as manual_control.py).
+Disk recording is off unless you pass --record.
 
 Press Ctrl+C or ESC to destroy spawned actors and exit.
 
-Click the pygame window so keys go to the ego Mustang.
+Click the pygame window so keys go to the ego Mustang. Look at that window,
+not the Unreal spectator, for the smooth camera view.
 
   W / S         throttle / brake
   A / D         steer
@@ -22,16 +24,19 @@ Examples:
     python spawn_npcs.py --vehicles 50 --walkers 20
     python spawn_npcs.py --no-autopilot
     python spawn_npcs.py --follow
-    python spawn_npcs.py --output _out
+    python spawn_npcs.py --record --output _out
     python spawn_npcs.py --ego-autopilot
 """
 
 import argparse
+import math
 import os
 import random
 import time
+import weakref
 
 import carla
+import numpy as np
 
 try:
     import pygame
@@ -116,23 +121,76 @@ def spawn_walkers(world, count):
     return walkers, controllers
 
 
-def attach_rgb_camera(world, ego_vehicle, output_dir):
-    os.makedirs(output_dir, exist_ok=True)
-    camera_init_trans = carla.Transform(carla.Location(z=1.5))
+VIEW_WIDTH = 1280
+VIEW_HEIGHT = 720
+
+
+class CameraView(object):
+    __slots__ = ('surface', '__weakref__')
+
+    def __init__(self):
+        self.surface = None
+
+
+def stabilize_vehicle_physics(vehicle):
+    physics = vehicle.get_physics_control()
+    physics.use_sweep_wheel_collision = True
+    vehicle.apply_physics_control(physics)
+
+
+def attach_rgb_camera(world, ego_vehicle, output_dir=None):
     camera_bp = world.get_blueprint_library().find('sensor.camera.rgb')
-    camera = world.spawn_actor(camera_bp, camera_init_trans, attach_to=ego_vehicle)
-    pattern = os.path.join(output_dir, '%06d.png').replace('\\', '/')
-    camera.listen(lambda image: image.save_to_disk(pattern % image.frame))
-    return camera
+    camera_bp.set_attribute('image_size_x', str(VIEW_WIDTH))
+    camera_bp.set_attribute('image_size_y', str(VIEW_HEIGHT))
+    if camera_bp.has_attribute('motion_blur_intensity'):
+        camera_bp.set_attribute('motion_blur_intensity', '0.0')
+    if camera_bp.has_attribute('enable_postprocess_effects'):
+        camera_bp.set_attribute('enable_postprocess_effects', 'False')
+
+    bound_x = 0.5 + ego_vehicle.bounding_box.extent.x
+    bound_z = 0.5 + ego_vehicle.bounding_box.extent.z
+    camera_init_trans = carla.Transform(
+        carla.Location(x=-2.0 * bound_x, z=2.0 * bound_z),
+        carla.Rotation(pitch=8.0),
+    )
+    camera = world.spawn_actor(
+        camera_bp,
+        camera_init_trans,
+        attach_to=ego_vehicle,
+        attachment_type=carla.AttachmentType.SpringArmGhost,
+    )
+
+    view = CameraView()
+    pattern = None
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+        pattern = os.path.join(output_dir, '%06d.png').replace('\\', '/')
+
+    weak_view = weakref.ref(view)
+
+    def on_image(image):
+        holder = weak_view()
+        if holder is None:
+            return
+        array = np.frombuffer(image.raw_data, dtype=np.uint8)
+        array = np.reshape(array, (image.height, image.width, 4))
+        array = array[:, :, :3][:, :, ::-1]
+        holder.surface = pygame.surfarray.make_surface(array.swapaxes(0, 1))
+        if pattern is not None:
+            image.save_to_disk(pattern % image.frame)
+
+    camera.listen(on_image)
+    return camera, view
 
 
 def follow_ego(world, ego):
     spectator = world.get_spectator()
     transform = ego.get_transform()
-    forward = transform.get_forward_vector()
+    yaw_rad = math.radians(transform.rotation.yaw)
     spectator.set_transform(
         carla.Transform(
-            transform.location - 8.0 * forward + carla.Location(z=3.5),
+            transform.location
+            + carla.Location(x=-8.0 * math.cos(yaw_rad), y=-8.0 * math.sin(yaw_rad), z=3.5),
             carla.Rotation(pitch=-12.0, yaw=transform.rotation.yaw),
         )
     )
@@ -147,18 +205,21 @@ DRIVE_HELP = [
 ]
 
 
-def drive_ego(world, ego, follow):
+def drive_ego(world, ego, camera, view):
     pygame.init()
     pygame.display.set_caption('CARLA ego — click this window to drive')
-    screen = pygame.display.set_mode((420, 200))
+    screen = pygame.display.set_mode((VIEW_WIDTH, VIEW_HEIGHT), pygame.HWSURFACE | pygame.DOUBLEBUF)
     font = pygame.font.Font(None, 28)
     clock = pygame.time.Clock()
     reverse = False
+    throttle = 0.0
+    brake = 0.0
+    steer_cache = 0.0
 
-    print('Click the pygame window, then use WASD to drive.')
+    print('Click the pygame window (the camera view), then use WASD to drive.')
     running = True
     while running:
-        clock.tick(60)
+        milliseconds = clock.tick_busy_loop(60)
         keys = pygame.key.get_pressed()
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
@@ -170,28 +231,42 @@ def drive_ego(world, ego, follow):
                     reverse = not reverse
                     print('Reverse %s' % ('on' if reverse else 'off'))
 
-        control = carla.VehicleControl()
-        control.throttle = 1.0 if keys[K_w] else 0.0
-        control.brake = 1.0 if keys[K_s] else 0.0
-        steer = 0.0
+        if keys[K_w]:
+            throttle = min(throttle + 0.1, 1.0)
+        else:
+            throttle = 0.0
+        if keys[K_s]:
+            brake = min(brake + 0.2, 1.0)
+        else:
+            brake = 0.0
+
+        steer_increment = 5e-4 * milliseconds
         if keys[K_a]:
-            steer -= 0.7
-        if keys[K_d]:
-            steer += 0.7
-        control.steer = steer
+            steer_cache = 0.0 if steer_cache > 0 else steer_cache - steer_increment
+        elif keys[K_d]:
+            steer_cache = 0.0 if steer_cache < 0 else steer_cache + steer_increment
+        else:
+            steer_cache = 0.0
+        steer_cache = min(0.7, max(-0.7, steer_cache))
+
+        control = carla.VehicleControl()
+        control.throttle = throttle
+        control.brake = brake
+        control.steer = round(steer_cache, 1)
         control.hand_brake = bool(keys[K_SPACE])
         control.reverse = reverse
         ego.apply_control(control)
 
-        world.wait_for_tick()
-        if follow:
-            follow_ego(world, ego)
+        # Spring-arm pose, not the bouncing chassis origin.
+        world.get_spectator().set_transform(camera.get_transform())
 
-        screen.fill((20, 20, 24))
+        if view.surface is not None:
+            screen.blit(view.surface, (0, 0))
+        else:
+            screen.fill((20, 20, 24))
         y = 16
         for line in DRIVE_HELP:
-            color = (230, 230, 230) if line else (20, 20, 24)
-            screen.blit(font.render(line, True, color), (16, y))
+            screen.blit(font.render(line, True, (230, 230, 230)), (16, y))
             y += 28
         pygame.display.flip()
 
@@ -242,9 +317,10 @@ def main():
     parser.add_argument('-w', '--walkers', type=int, default=20, help='Number of pedestrians (default: 20)')
     parser.add_argument('--no-autopilot', action='store_true', help='Spawn vehicles parked, without Traffic Manager')
     parser.add_argument('--ego-autopilot', action='store_true', help='Also put the ego vehicle on autopilot')
-    parser.add_argument('--follow', action='store_true', help='Keep the spectator camera behind the ego vehicle')
-    parser.add_argument('--output', default='_out', help='Folder for RGB camera PNGs (default: _out)')
-    parser.add_argument('--no-record', action='store_true', help='Do not attach the ego RGB camera')
+    parser.add_argument('--follow', action='store_true', help='Keep the Unreal spectator behind the ego (uses the spring-arm camera)')
+    parser.add_argument('--output', default='_out', help='Folder for RGB camera PNGs when --record is set')
+    parser.add_argument('--record', action='store_true', help='Save every RGB frame to disk (causes hitching)')
+    parser.add_argument('--no-record', action='store_true', help='Deprecated: recording is already off unless --record')
     args = parser.parse_args()
 
     client, world = connect(args.host, args.port)
@@ -268,15 +344,20 @@ def main():
 
         ego_vehicle = spawn_ego_vehicle(world, spawn_points, len(npc_vehicles))
         print('Spawned ego vehicle: %s (id=%d)' % (ego_vehicle.type_id, ego_vehicle.id))
+        stabilize_vehicle_physics(ego_vehicle)
         follow_ego(world, ego_vehicle)
 
-        if not args.no_record:
+        output_dir = None
+        if args.record and not args.no_record:
             output_dir = args.output
             if not os.path.isabs(output_dir):
                 repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
                 output_dir = os.path.join(repo_root, output_dir)
-            camera = attach_rgb_camera(world, ego_vehicle, output_dir)
-            print('RGB camera recording to %s' % output_dir)
+            print('RGB camera recording to %s (this will hitch the sim)' % output_dir)
+        else:
+            print('Disk recording off (pass --record to save PNGs). Watch the pygame camera window.')
+
+        camera, camera_view = attach_rgb_camera(world, ego_vehicle, output_dir)
 
         walkers, controllers = spawn_walkers(world, args.walkers)
         print('Spawned %d / %d pedestrians' % (len(walkers), args.walkers))
@@ -299,7 +380,7 @@ def main():
                 if args.follow:
                     follow_ego(world, ego_vehicle)
         else:
-            drive_ego(world, ego_vehicle, follow=True)
+            drive_ego(world, ego_vehicle, camera, camera_view)
 
     except KeyboardInterrupt:
         print('\nStopping...')
