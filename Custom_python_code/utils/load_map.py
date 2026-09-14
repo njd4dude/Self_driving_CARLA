@@ -11,7 +11,7 @@ Examples:
 import argparse
 import sys
 
-import carladddda
+import carla
 
 
 def short_map_name(name):
